@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,8 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parents[1]
 DATA_FILE = ROOT / "data" / "passport_reference.json"
 OFFICIAL_FEE_URL = "https://www.epassport.gov.bd/instructions/passport-fees"
+CURRENT_YEAR = datetime.now().year
+FEE_REFERENCE_KEY = f"fees_{CURRENT_YEAR}"
 
 load_dotenv(ROOT / ".env")
 
@@ -31,45 +34,260 @@ def load_reference_data() -> dict[str, Any]:
         return json.load(f)
 
 
-def try_fetch_official_page(timeout: int = 8) -> dict[str, Any]:
+def _parse_official_fee_table(soup: BeautifulSoup, reference: dict[str, Any]) -> dict[str, Any] | None:
+    """Parse a fee table only when all 12 expected combinations can be mapped confidently.
+
+    The official site may change its HTML or render content dynamically. In that case,
+    return None and keep the reviewed local fee values untouched.
     """
-    Best-effort scrape of the official fee page.
-    This is deliberately not used to overwrite local fees automatically:
-    page markup can change, so the local reviewed fee table remains the fallback.
+    deliveries = {
+        "regular": ("regular", "normal"),
+        "express": ("express",),
+        "super_express": ("super express", "super-express", "super express delivery"),
+    }
+    found: dict[str, dict[str, dict[str, int]]] = {}
+    for table in soup.find_all("table"):
+        rows = []
+        for tr in table.find_all("tr"):
+            cells = [" ".join(cell.stripped_strings).strip() for cell in tr.find_all(["th", "td"])]
+            if cells:
+                rows.append(cells)
+        if len(rows) < 2:
+            continue
+        header = " | ".join(rows[0]).lower()
+        # Determine columns from the header; require explicit delivery labels.
+        col_map: dict[str, int] = {}
+        for delivery, labels in deliveries.items():
+            for idx, cell in enumerate(rows[0]):
+                normalized = re.sub(r"\s+", " ", cell.lower().replace("_", " ")).strip()
+                if delivery == "express" and "super" in normalized:
+                    continue
+                if any(label in normalized for label in labels):
+                    col_map[delivery] = idx
+                    break
+        if not all(key in col_map for key in deliveries):
+            # Some tables use a two-row header; inspect combined header text.
+            combined = " | ".join(" ".join(row) for row in rows[:2]).lower()
+            if not all(any(label in combined for label in labels) for labels in deliveries.values()):
+                continue
+            continue  # Ambiguous multi-row headers are deliberately not guessed.
+        for row in rows[1:]:
+            label = " ".join(row).lower()
+            page_match = re.search(r"\b(48|64)\s*(?:pages?|page)\b", label)
+            year_match = re.search(r"\b(5|10)\s*(?:years?|year)\b", label)
+            if not page_match or not year_match:
+                continue
+            pages, years = int(page_match.group(1)), int(year_match.group(1))
+            row_values = {}
+            for delivery, idx in col_map.items():
+                if idx >= len(row):
+                    row_values = {}
+                    break
+                digits = re.sub(r"[^0-9]", "", row[idx])
+                if not digits:
+                    row_values = {}
+                    break
+                amount = int(digits)
+                # Fees in this project are in the low tens of thousands. Reject IDs/dates.
+                if not 1000 <= amount <= 50000:
+                    row_values = {}
+                    break
+                row_values[delivery] = amount
+            if len(row_values) == 3:
+                found.setdefault(f"{pages}_pages", {}).setdefault(f"{years}_years", {}).update(row_values)
+    expected = {
+        f"{pages}_pages": {f"{years}_years" for years in (5, 10)}
+        for pages in (48, 64)
+    }
+    if not all(
+        page in found and all(year in found[page] and all(d in found[page][year] for d in deliveries) for year in years)
+        for page, years in expected.items()
+    ):
+        return None
+    return found
+
+
+
+def _parse_official_fee_text(page_text: str) -> dict[str, dict[str, dict[str, int]]] | None:
+    """Parse the official page's section/list format (not just HTML tables)."""
+    text = re.sub(r"\s+", " ", page_text).strip()
+    
+    # Flexible heading matcher for "48 pages ... 5 years"
+    heading_re = re.compile(
+        r"(48|64)\s*[- ]?pages?\s+(?:and|with|,)?\s*(5|10)\s*[- ]?years?\s*(?:validity)?",
+        re.IGNORECASE,
+    )
+    headings = list(heading_re.finditer(text))
+    if len(headings) < 4:
+        return None
+
+    found: dict[str, dict[str, dict[str, int]]] = {}
+    delivery_patterns = {
+        "regular": r"regular(?:\s+delivery)?[^0-9]{0,25}?([0-9][0-9,]{2,5})",
+        "express": r"(?<!super\s)(?<!super-)express(?:\s+delivery)?[^0-9]{0,25}?([0-9][0-9,]{2,5})",
+        "super_express": r"super[\s-]+express(?:\s+delivery)?[^0-9]{0,25}?([0-9][0-9,]{2,5})",
+    }
+    for i, heading in enumerate(headings):
+        end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
+        section = text[heading.end():end]
+        pages, years = int(heading.group(1)), int(heading.group(2))
+        values: dict[str, int] = {}
+        for delivery, pattern in delivery_patterns.items():
+            match = re.search(pattern, section, re.IGNORECASE)
+            if not match:
+                values = {}
+                break
+            amount = int(match.group(1).replace(",", ""))
+            if not 1000 <= amount <= 50000:
+                values = {}
+                break
+            values[delivery] = amount
+        if len(values) == 3:
+            found.setdefault(f"{pages}_pages", {})[f"{years}_years"] = values
+
+    expected_pages = ("48_pages", "64_pages")
+    expected_years = ("5_years", "10_years")
+    if not all(
+        page in found and year in found[page] and
+        all(delivery in found[page][year] for delivery in ("regular", "express", "super_express"))
+        for page in expected_pages for year in expected_years
+    ):
+        return None
+    return found
+
+
+def _fetch_with_edge_browser(url: str, timeout: int) -> tuple[str, str]:
+    """Try a normal installed Microsoft Edge session to render JavaScript content."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="msedge", headless=True)
+        try:
+            page = browser.new_page(
+                locale="en-US",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+                ),
+            )
+            # Wait until network requests settle (critical for Angular SPAs)
+            page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            
+            # Wait up to 8 seconds specifically for fee numbers/text to render
+            try:
+                page.wait_for_selector("text=/48\\s*pages/i", timeout=8000)
+            except Exception:
+                page.wait_for_timeout(4000)
+                
+            return page.locator("body").inner_text(timeout=5000), page.content()
+        finally:
+            browser.close()
+
+def refresh_reference_data(timeout: int = 20) -> dict[str, Any]:
+    """Refresh from the official portal using HTTP first, then normal Edge rendering.
+
+    The portal may block scripted requests or render the fee information dynamically.
+    The local JSON is changed only after all 12 domestic fee values are parsed.
     """
-    try:
-        response = requests.get(
-            OFFICIAL_FEE_URL,
-            timeout=timeout,
-            headers={"User-Agent": "AmarPassportEducationalProject/1.0"},
+    from datetime import datetime, timezone
+
+    reference = load_reference_data()
+    urls = [
+        OFFICIAL_FEE_URL,
+        "https://epassport.gov.bd/instructions/passport-fees",
+    ]
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
+        "Referer": "https://www.epassport.gov.bd/",
+    }
+    errors: list[str] = []
+
+    for url in urls:
+        page_text = ""
+        page_html = ""
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            response.raise_for_status()
+            page_html = response.text
+            page_text = " ".join(BeautifulSoup(page_html, "html.parser").stripped_strings)
+        except Exception as exc:
+            errors.append(f"HTTP {url}: {type(exc).__name__}: {exc}")
+
+        parsed_fees = None
+        if page_text:
+            parsed_fees = _parse_official_fee_table(BeautifulSoup(page_html, "html.parser"), reference)
+            if parsed_fees is None:
+                parsed_fees = _parse_official_fee_text(page_text)
+
+        # Use the installed Edge browser if HTTP was blocked or the response did not
+        # contain a complete fee table. Playwright is an optional dependency.
+        if parsed_fees is None:
+            try:
+                browser_text, browser_html = _fetch_with_edge_browser(url, timeout)
+                parsed_fees = _parse_official_fee_table(BeautifulSoup(browser_html, "html.parser"), reference)
+                if parsed_fees is None:
+                    parsed_fees = _parse_official_fee_text(browser_text)
+                if parsed_fees is None:
+                    errors.append(f"Edge {url}: page loaded, but the full 12-value fee table was not recognized")
+            except ImportError:
+                errors.append("Edge fallback unavailable: install Playwright with 'pip install playwright'; Microsoft Edge must be installed")
+            except Exception as exc:
+                errors.append(f"Edge {url}: {type(exc).__name__}: {exc}")
+
+        if parsed_fees is None:
+            continue
+
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        reference[FEE_REFERENCE_KEY] = parsed_fees
+        reference["fees_note"] = (
+            "Domestic fees parsed from the official Bangladesh e-Passport portal at runtime. "
+            "Verify current fees and VAT treatment before applying."
         )
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        text = " ".join(soup.stripped_strings)
-        if not text or "e-Passport" not in text:
-            raise ValueError("Official page returned unexpected content.")
-        return {
+        reference["portal_sync"] = {
             "status": "success",
-            "source": OFFICIAL_FEE_URL,
-            "note": "Official page fetched. Fees are still calculated from the reviewed local reference table.",
+            "source": url,
+            "last_checked_utc": now,
+            "fees_updated": True,
+            "note": "All 12 domestic fee values were parsed from the official page and saved. Verify before applying.",
         }
-    except Exception as exc:
-        return {
-            "status": "fallback",
-            "source": str(DATA_FILE),
-            "note": f"Could not fetch official page ({type(exc).__name__}: {exc}). Using local fallback data.",
-        }
+        temp_file = DATA_FILE.with_suffix(".json.tmp")
+        temp_file.write_text(json.dumps(reference, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temp_file.replace(DATA_FILE)
+        return {"status": "success", "source": url, "note": reference["portal_sync"]["note"]}
+
+    # Persist only the status metadata; never replace local fees with partial data.
+    reference["portal_sync"] = {
+        "status": "fallback",
+        "source": str(DATA_FILE),
+        "last_checked_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "fees_updated": False,
+        "note": "Official refresh failed. Existing local fee values were preserved. " + " | ".join(errors),
+    }
+    temp_file = DATA_FILE.with_suffix(".json.tmp")
+    temp_file.write_text(json.dumps(reference, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp_file.replace(DATA_FILE)
+    return {"status": "fallback", "source": str(DATA_FILE), "note": reference["portal_sync"]["note"]}
+
+
+# Set by main() before user input. create_report() reuses the startup result.
+STARTUP_FETCH_STATUS: dict[str, Any] | None = None
 
 
 def make_llm() -> LLM:
     """Configure CrewAI to use the supplied OpenAI-compatible endpoint."""
-    api_key = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("API_KEY")
     base_url = os.getenv("BASE_URL", "https://api.cheaperinference.com/v1")
     model = os.getenv("MODEL_NAME", "glm-5.3")
     if not api_key or api_key == "put_your_api_key_here":
         raise EnvironmentError(
             "API key is missing. Copy .env.example to .env and set API_KEY. "
-            "Never commit .env or share your API key."
         )
     return LLM(
         model=model,
@@ -143,7 +361,7 @@ def calculate_fee(profile: dict[str, Any], reference: dict[str, Any], policy: di
     if age < 18:
         pages = 48
     delivery = policy["delivery"]
-    fee = reference["fees_2026"][f"{pages}_pages"][f"{validity}_years"][delivery]
+    fee = reference[FEE_REFERENCE_KEY][f"{pages}_pages"][f"{validity}_years"][delivery]
     return {
         "pages": pages,
         "validity_years": validity,
@@ -168,7 +386,7 @@ def build_agents(llm: LLM, reference: dict[str, Any]) -> tuple[Agent, Agent, Age
     )
     fee_agent = Agent(
         role="Chancellor of the Exchequer — Passport Fee Auditor",
-        goal="Calculate the exact domestic passport fee from the supplied 2026 local table, which already includes 15% VAT.",
+        goal=f"Calculate the exact domestic passport fee from the supplied {CURRENT_YEAR} local table, which already includes 15% VAT.",
         backstory=(
             "You are a meticulous financial auditor. Never estimate a fee when a table value is available. "
             "Never add VAT twice. Use only the provided reference data."
@@ -193,7 +411,7 @@ def build_agents(llm: LLM, reference: dict[str, Any]) -> tuple[Agent, Agent, Age
 
 def create_report(profile: dict[str, Any]) -> str:
     reference = load_reference_data()
-    fetch_status = try_fetch_official_page()
+    fetch_status = STARTUP_FETCH_STATUS or {"status": "fallback", "source": str(DATA_FILE), "note": "Using local reference JSON."}
     policy = validate_profile(profile, reference)
     fee = calculate_fee(profile, reference, policy)
 
@@ -220,7 +438,7 @@ def create_report(profile: dict[str, Any]) -> str:
                 "Use the Policy Guardian output as context and the supplied deterministic fee result. "
                 "Report pages, validity, delivery, fee in BDT, and state VAT is included. Do not change the calculated fee. "
                 f"Calculated fee record: {json.dumps(fee, ensure_ascii=False)}\n"
-                f"Reference fee table: {json.dumps(reference['fees_2026'], ensure_ascii=False)}"
+                f"Reference fee table: {json.dumps(reference[FEE_REFERENCE_KEY], ensure_ascii=False)}"
             ),
             expected_output="A fee audit summary including the exact BDT amount and VAT note.",
             agent=fee_agent,
@@ -381,14 +599,87 @@ def _extract_age(sentence: str) -> int | None:
     return None
 
 
+def _llm_extract_profile(sentence: str) -> dict[str, Any] | None:
+    """Extract profile fields using an OpenAI-compatible chat API; return None on any failure."""
+    api_key = os.getenv("API_KEY")
+    if not api_key or api_key == "put_your_api_key_here":
+        print("LLM extraction unavailable (API key missing); using regex fallback.")
+        return None
+
+    base_url = os.getenv("BASE_URL", "https://api.cheaperinference.com/v1").rstrip("/")
+    model = os.getenv("MODEL_NAME", "glm-5.3")
+    schema = {
+        "age": "integer or null",
+        "profession": "string or null; normalized category/description",
+        "pages": "48, 64, or null",
+        "requested_validity": "5, 10, or null",
+        "delivery": "regular, express, super_express, or null",
+        "urgency": "string or null; use Not specified if no deadline is mentioned",
+        "location": "string or null; city/district only",
+        "has_nid": "yes, no, unknown",
+        "has_birth_registration": "yes, no, unknown",
+        "name_change": "boolean or null",
+        "previous_passport": "boolean or null",
+    }
+    prompt = (
+        "Extract only facts explicitly stated or clearly implied in the user's passport request. "
+        "Do not invent missing details. Return exactly one valid JSON object, no markdown. "
+        "For delivery, normalize normal/regular to regular, express/urgent to express, and super express to super_express. "
+        "For NID and birth registration, use yes/no only when the user states possession/non-possession; otherwise unknown. "
+        "For name_change, true if the user says they want/need a name change or correction, false only if explicitly denied, otherwise null. "
+        "For previous_passport, true for old/previous passport or renewal, false only if explicitly denied, otherwise null. "
+        f"Required JSON fields and types: {json.dumps(schema)}\nUser description: {sentence}"
+    )
+    try:
+        response = requests.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": "You extract structured data accurately. Output valid JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                "response_format": {"type": "json_object"},
+            },
+            timeout=25,
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        data = json.loads(content)
+        if not isinstance(data, dict):
+            return None
+        # Sanitize each field; bad/missing values remain unknown for regex/manual fallback.
+        if not isinstance(data.get("age"), int) or isinstance(data.get("age"), bool) or not 1 <= data["age"] <= 120:
+            data["age"] = None
+        if data.get("pages") not in (48, 64): data["pages"] = None
+        if data.get("requested_validity") not in (5, 10): data["requested_validity"] = None
+        if data.get("delivery") not in ("regular", "express", "super_express"): data["delivery"] = None
+        if not isinstance(data.get("profession"), str) or not data["profession"].strip(): data["profession"] = None
+        if not isinstance(data.get("location"), str) or not data["location"].strip(): data["location"] = None
+        if not isinstance(data.get("urgency"), str) or not data["urgency"].strip(): data["urgency"] = None
+        for key in ("has_nid", "has_birth_registration"):
+            if data.get(key) not in ("yes", "no", "unknown"): data[key] = "unknown"
+        for key in ("name_change", "previous_passport"):
+            if data.get(key) not in (True, False): data[key] = None
+        print("LLM extraction succeeded; missing or invalid fields will use regex/manual fallback.")
+        return data
+    except Exception as exc:
+        print(f"LLM extraction failed ({type(exc).__name__}); using regex fallback.")
+        return None
+
+
 def ask_profile() -> dict[str, Any]:
     """Collect a natural-language profile, then ask only for missing details."""
     print("=== Amar Passport: Bangladesh E-Passport Readiness ===")
     print("Describe your passport needs in one sentence. Example:")
     print('I am a 24-year-old private employee. I need a 64-page, 10-year passport as express. I have an NID and live in Dhaka.')
     sentence = input("Your description: ").strip()
+    llm_profile = _llm_extract_profile(sentence) or {}
+    lower = sentence.lower()
 
-    age = _extract_age(sentence)
+    age = llm_profile.get("age") or _extract_age(sentence)
     while age is None or age < 1 or age > 120:
         if age is not None:
             print(f"The age '{age}' looks invalid. Please confirm an age from 1 to 120 (for example, 15 or 21).")
@@ -398,21 +689,20 @@ def ask_profile() -> dict[str, Any]:
         except ValueError:
             age = None
 
-    lower = sentence.lower()
-    profession = ""
-    if re.search(r"\b(student|stusent|studnt|pupil|school student|university student)\b", lower):
+    profession = llm_profile.get("profession") or ""
+    if not profession and re.search(r"\b(student|stusent|studnt|pupil|school student|university student)\b", lower):
         profession = "student"
-    elif re.search(r"\b(private[- ]?(sector )?employee|private[- ]?job|private employee|corporate employee)\b", lower):
+    elif not profession and re.search(r"\b(private[- ]?(sector )?(employee|employe|service|job)|private employee|private service|corporate employee)\b", lower):
         profession = "private sector employee"
-    elif re.search(r"\b(government employee|govt employee|government staff|civil servant)\b", lower):
+    elif not profession and re.search(r"\b(government employee|govt employee|government staff|civil servant)\b", lower):
         profession = "government employee"
-    elif re.search(r"\b(self[- ]?employed|business owner|businessman|businesswoman|entrepreneur)\b", lower):
+    elif not profession and re.search(r"\b(self[- ]?employed|business owner|businessman|businesswoman|entrepreneur)\b", lower):
         profession = "self-employed / business"
     if not profession:
         profession = input("Profession (student/private employee/government employee/etc.): ").strip()
 
     page_match = re.search(r"\b(48|64)\s*[- ]?(?:page|pages)\b|\b(?:pages?\s*)(48|64)\b", lower)
-    pages = int(next(group for group in page_match.groups() if group)) if page_match else None
+    pages = llm_profile.get("pages") or (int(next(group for group in page_match.groups() if group)) if page_match else None)
     while pages not in (48, 64):
         raw = input("Passport pages [48/64] (default 48): ").strip() or "48"
         try:
@@ -423,7 +713,7 @@ def ask_profile() -> dict[str, Any]:
             print("Please enter 48 or 64.")
 
     validity_match = re.search(r"\b(5|10)\s*[- ]?year(?:s)?\b|\bvalidity\s*(?:of|:)?\s*(5|10)\b", lower)
-    validity = int(next(group for group in validity_match.groups() if group)) if validity_match else None
+    validity = llm_profile.get("requested_validity") or (int(next(group for group in validity_match.groups() if group)) if validity_match else None)
     if validity is None:
         recommended = 5 if age < 18 else 10
         if age < 18:
@@ -435,7 +725,9 @@ def ask_profile() -> dict[str, Any]:
                 raw = input("Please enter 5 or 10: ").strip()
             validity = int(raw)
 
-    if re.search(r"\bsuper[- _]?express\b", lower):
+    if llm_profile.get("delivery"):
+        delivery = llm_profile["delivery"]
+    elif re.search(r"\bsuper[- _]?express\b", lower):
         delivery = "super_express"
     elif re.search(r"\bexpress\b|\burgent\b|\bwithin\s+(?:one|two|1|2)\s+weeks?\b", lower):
         delivery = "express"
@@ -450,12 +742,16 @@ def ask_profile() -> dict[str, Any]:
             delivery = aliases.get(raw, raw)
 
     nid_match = re.search(r"\b(no|don't have|do not have|without)\s+(?:an?\s+)?nid\b", lower)
-    has_nid = "no" if nid_match else ("yes" if re.search(r"\b(?:have|with)\s+(?:an?\s+)?nid\b|\bnid\b", lower) else "unknown")
+    has_nid = llm_profile.get("has_nid", "unknown")
+    if has_nid == "unknown":
+        has_nid = "no" if nid_match else ("yes" if re.search(r"\b(?:have|with)\s+(?:an?\s+)?nid\b|\bnid\b", lower) else "unknown")
     if has_nid == "unknown":
         has_nid = "yes" if _ask_yes_no("Do you have a National ID (NID)?") else "no"
 
     brc_match = re.search(r"\b(?:birth registration|brc)\b", lower)
-    if brc_match:
+    if llm_profile.get("has_birth_registration", "unknown") != "unknown":
+        has_brc = llm_profile["has_birth_registration"]
+    elif brc_match:
         has_brc = "no" if re.search(r"\b(?:no|without|don't have|do not have)\s+(?:an?\s+)?(?:english\s+)?(?:birth registration|brc)", lower) else "yes"
     elif age < 18:
         has_brc = "yes" if _ask_yes_no("Do you have an English Birth Registration Certificate (BRC)?") else "no"
@@ -463,21 +759,44 @@ def ask_profile() -> dict[str, Any]:
         has_brc = "unknown"
 
     location_match = re.search(r"\b(?:live|living|reside|residing)\s+in\s+([A-Za-z][A-Za-z .'-]*?)(?:[.,;]|$)", sentence, re.IGNORECASE)
-    location = location_match.group(1).strip() if location_match else ""
+    location = (llm_profile.get("location") or (location_match.group(1).strip() if location_match else ""))
     if not location:
         location = input("City/district where you will apply (e.g., Dhaka): ").strip()
 
-    name_change = bool(re.search(r"\b(name changed|name change|changed my name|different name)\b", lower))
-    if not name_change:
-        name_change = _ask_yes_no("Have you changed your name or do your documents show different names?", default=False)
-    previous_passport = bool(re.search(r"\b(previous passport|old passport|renewal)\b", lower)) and not bool(re.search(r"\b(no|never|don't have|do not have)\s+(?:a\s+)?(?:previous|old) passport\b", lower))
-    if not re.search(r"\b(previous passport|old passport|renewal)\b", lower):
-        previous_passport = _ask_yes_no("Do you have a previous passport?", default=False)
+    name_change = llm_profile.get("name_change")
+    if name_change is None:
+        name_change_match = re.search(
+            r"\b(name changed|name change|changed my name|change my name|"
+            r"need(?: to)? change my name|want(?: to)? change my name|"
+            r"different name|name correction|correct my name)\b",
+            lower,
+        )
+        if name_change_match:
+            name_change = True
+        else:
+            name_change = _ask_yes_no(
+                "Have you changed your name or do your documents show different names?", default=False
+            )
+
+    previous_passport = llm_profile.get("previous_passport")
+    if previous_passport is None:
+        has_previous_phrase = bool(re.search(r"\b(previous passport|old passport|renewal)\b", lower))
+        explicitly_no_previous = bool(re.search(
+            r"\b(no|never|don't have|do not have)\s+(?:a\s+)?(?:previous|old) passport\b", lower
+        ))
+        if has_previous_phrase:
+            previous_passport = not explicitly_no_previous
+        else:
+            previous_passport = _ask_yes_no("Do you have a previous passport?", default=False)
 
     urgency_match = re.search(r"\b(?:urgent|business trip|travel|flight|trip)\b[^.!?;]*", sentence, re.IGNORECASE)
-    urgency = urgency_match.group(0).strip() if urgency_match else "Not specified"
+    urgency = llm_profile.get("urgency") or (urgency_match.group(0).strip() if urgency_match else "Not specified")
     if urgency == "Not specified":
-        urgency = input("Any travel deadline or urgency? (press Enter if none): ").strip() or "Not specified"
+        if delivery == "regular":
+            # Regular delivery does not require a travel-deadline prompt.
+            urgency = "Not specified"
+        else:
+            urgency = input("Any travel deadline or urgency? (press Enter if none): ").strip() or "Not specified"
 
     if age < 18 and (validity == 10 or pages == 64):
         print("\nEligibility warning: this project flags applicants under 18 for a 5-year, 48-page passport.")
@@ -510,7 +829,11 @@ def ask_profile() -> dict[str, Any]:
 
 
 def main() -> None:
+    global STARTUP_FETCH_STATUS
     try:
+        print("Refreshing passport reference data from the official Bangladesh e-Passport portal...")
+        STARTUP_FETCH_STATUS = refresh_reference_data()
+        print(f"Reference data status: {STARTUP_FETCH_STATUS['status']} — {STARTUP_FETCH_STATUS['note']}")
         profile = ask_profile()
         report = create_report(profile)
         output_file = ROOT / "passport_readiness_report.md"

@@ -67,13 +67,8 @@ Answer the prompts. The generated report is printed in the terminal and saved as
 ## Example scenario
 
 Input:
-- Age: 24
-- Profession: private sector employee
-- Pages: 64
+"I am a 24-year-old private sector employee. I need a 64-page passport urgently because I have a business trip in two weeks. I have an NID and I live in Dhaka."
 - Requested validity: 10
-- Delivery: express
-- Urgency: business trip in two weeks
-- Has NID: yes
 - Name change: no
 
 Expected fee from the current local reference table: **BDT 10,350**, inclusive of 15% VAT. Actual eligibility and delivery availability should be confirmed on the official portal.
@@ -112,6 +107,8 @@ Document Architect
        |
        v
 English Markdown table + Bangla summary
+
+![CrewAI — Coordinator](image.png)
 ```
 
 If the API key is missing, the LLM request fails, or web scraping is unavailable, the deterministic local fallback is used.
@@ -130,13 +127,7 @@ git remote add origin https://github.com/ahmmadhossain/amar-passport-ai-agent.gi
 git push -u origin main
 ```
 
-Replace `YOUR_GITHUB_USERNAME` with your GitHub username. If `origin` already exists, inspect it with `git remote -v` and use `git remote set-url origin <repository-url>` instead of adding it again.
-
-Before pushing, verify that `.env` is not staged:
-
 ```powershell
 git status
 git check-ignore .env
 ```
-
-![CrewAI — Coordinator](image.png)

@@ -1,6 +1,6 @@
 {
   "source": "https://www.epassport.gov.bd/instructions/passport-fees",
-  "fees_note": "Domestic Bangladesh fee values, inclusive of 15% VAT; last reviewed for this educational project in October 2026. Verify before use.",
+  "fees_note": "Domestic fees parsed from the official Bangladesh e-Passport portal at runtime. Verify current fees and VAT treatment before applying.",
   "fees_2026": {
     "48_pages": {
       "5_years": {
@@ -47,5 +47,12 @@
     "regular": "Within 15 working days / 21 days from biometric enrolment",
     "express": "Within 7 working days / 10 days from biometric enrolment",
     "super_express": "Within 2 working days from biometric enrolment"
+  },
+  "portal_sync": {
+    "status": "success",
+    "source": "https://www.epassport.gov.bd/instructions/passport-fees",
+    "last_checked_utc": "2026-10-24T18:27:11+00:00",
+    "fees_updated": true,
+    "note": "All 12 domestic fee values were parsed from the official page and saved. Verify before applying."
   }
 }
