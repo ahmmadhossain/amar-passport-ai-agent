@@ -108,8 +108,8 @@ Document Architect
        v
 English Markdown table + Bangla summary
 
-![CrewAI — Coordinator](image.png)
 ```
+![CrewAI — Coordinator](image.png)
 
 If the API key is missing, the LLM request fails, or web scraping is unavailable, the deterministic local fallback is used.
 
