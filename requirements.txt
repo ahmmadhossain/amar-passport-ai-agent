@@ -1,0 +1,4 @@
+crewai>=0.130.0
+python-dotenv>=1.0.1
+requests>=2.32.0
+beautifulsoup4>=4.12.3

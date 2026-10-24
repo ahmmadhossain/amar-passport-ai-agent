@@ -1,0 +1,51 @@
+{
+  "source": "https://www.epassport.gov.bd/instructions/passport-fees",
+  "fees_note": "Domestic Bangladesh fee values, inclusive of 15% VAT; last reviewed for this educational project in October 2026. Verify before use.",
+  "fees_2026": {
+    "48_pages": {
+      "5_years": {
+        "regular": 4025,
+        "express": 6325,
+        "super_express": 8625
+      },
+      "10_years": {
+        "regular": 5750,
+        "express": 8050,
+        "super_express": 10350
+      }
+    },
+    "64_pages": {
+      "5_years": {
+        "regular": 6325,
+        "express": 8625,
+        "super_express": 12075
+      },
+      "10_years": {
+        "regular": 8050,
+        "express": 10350,
+        "super_express": 13800
+      }
+    }
+  },
+  "required_docs": {
+    "adult": [
+      "NID Card or eligible identity document",
+      "Application Summary / appointment confirmation",
+      "Payment Slip"
+    ],
+    "minor_under_18": [
+      "English Birth Registration Certificate (BRC)",
+      "Parents' NID",
+      "3R photograph if requested by passport office"
+    ],
+    "government_staff": [
+      "NOC / GO or applicable retirement/PRL document",
+      "NID or applicable identity document"
+    ]
+  },
+  "delivery_targets": {
+    "regular": "Within 15 working days / 21 days from biometric enrolment",
+    "express": "Within 7 working days / 10 days from biometric enrolment",
+    "super_express": "Within 2 working days from biometric enrolment"
+  }
+}
